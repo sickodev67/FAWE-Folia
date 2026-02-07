@@ -31,15 +31,19 @@ import org.apache.logging.log4j.Logger;
 
 import javax.annotation.Nullable;
 import java.lang.reflect.Field;
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
+import java.lang.reflect.UndeclaredThrowableException;
 import java.lang.ref.WeakReference;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.ToIntFunction;
 
 import static com.sk89q.worldedit.bukkit.adapter.impl.fawe.v1_21_11.PaperweightPlatformAdapter.createInput;
@@ -324,57 +328,85 @@ public class PaperweightFaweWorldNativeAccess implements WorldNativeAccess<Level
                 "getServerTick",
                 "getTickCounter"
         };
-        private static volatile ToIntFunction<MinecraftServer> TICK_SUPPLIER;
+        private static final Set<String> DISABLED_STRATEGIES = ConcurrentHashMap.newKeySet();
+        private static final AtomicBoolean FALLBACK_WARNED = new AtomicBoolean(false);
+        private static final AtomicBoolean UNSUPPORTED_WARNED = new AtomicBoolean(false);
+        private static final long START_NANOS = System.nanoTime();
+        private static final Strategy FALLBACK_STRATEGY = new Strategy("approximate tick fallback", server -> {
+            long nanos = System.nanoTime() - START_NANOS;
+            return (int) (nanos / 50_000_000L);
+        });
+        private static volatile Strategy TICK_STRATEGY;
 
         private TickAccess() {
         }
 
         private static int getCurrentTick(MinecraftServer server) {
-            ToIntFunction<MinecraftServer> supplier = TICK_SUPPLIER;
-            if (supplier == null) {
-                synchronized (TickAccess.class) {
-                    supplier = TICK_SUPPLIER;
-                    if (supplier == null) {
-                        supplier = resolveTickSupplier(server);
-                        TICK_SUPPLIER = supplier;
-                    }
+            while (true) {
+                Strategy strategy = TICK_STRATEGY;
+                if (strategy == null || DISABLED_STRATEGIES.contains(strategy.name())) {
+                    strategy = resolveTickStrategy(server);
+                }
+                try {
+                    return strategy.supplier().applyAsInt(server);
+                } catch (UnsupportedTickSourceException ignored) {
+                    disableStrategy(strategy, "is unsupported on this server");
+                } catch (RuntimeException e) {
+                    disableStrategy(strategy, "failed with " + e.getClass().getSimpleName());
                 }
             }
-            return supplier.applyAsInt(server);
         }
 
-        private static ToIntFunction<MinecraftServer> resolveTickSupplier(MinecraftServer server) {
+        private static Strategy resolveTickStrategy(MinecraftServer server) {
             Class<?> serverClass = server != null ? server.getClass() : MinecraftServer.class;
+            Method bukkitMethod = findBukkitCurrentTickMethod();
+            if (bukkitMethod != null) {
+                Strategy strategy = new Strategy("Bukkit.getCurrentTick()", s -> invokeNumberMethod(bukkitMethod, null));
+                if (trySelectStrategy(server, strategy, "Bukkit.getCurrentTick()")) {
+                    return strategy;
+                }
+            }
             for (String name : FIELD_NAMES) {
                 Field field = findField(serverClass, name);
-                if (field == null || field.getType() != int.class) {
+                if (field == null) {
+                    continue;
+                }
+                Class<?> type = field.getType();
+                if (type != int.class && type != long.class) {
                     continue;
                 }
                 boolean isStatic = Modifier.isStatic(field.getModifiers());
                 field.setAccessible(true);
-                LOGGER.info("Resolved server tick via MinecraftServer field '{}'.", name);
-                return isStatic ? s -> getIntField(field, null) : s -> getIntField(field, s);
+                Strategy strategy = new Strategy("MinecraftServer field '" + name + "'", s -> getNumberField(field, isStatic ? null : s));
+                if (trySelectStrategy(server, strategy, strategy.name())) {
+                    return strategy;
+                }
             }
             for (String name : METHOD_NAMES) {
                 Method method = findMethod(serverClass, name);
-                if (method == null || method.getReturnType() != int.class || method.getParameterCount() != 0) {
+                if (method == null || method.getParameterCount() != 0) {
+                    continue;
+                }
+                Class<?> type = method.getReturnType();
+                if (type != int.class && type != long.class) {
                     continue;
                 }
                 boolean isStatic = Modifier.isStatic(method.getModifiers());
                 method.setAccessible(true);
-                LOGGER.info("Resolved server tick via MinecraftServer method '{}()'.", name);
-                return isStatic ? s -> invokeIntMethod(method, null) : s -> invokeIntMethod(method, s);
-            }
-            Method bukkitMethod = findBukkitCurrentTickMethod();
-            if (bukkitMethod != null) {
-                LOGGER.info("Resolved server tick via Bukkit.getCurrentTick().");
-                return s -> invokeIntMethod(bukkitMethod, null);
+                Strategy strategy = new Strategy("MinecraftServer method '" + name + "()'", s -> invokeNumberMethod(method, isStatic ? null : s));
+                if (trySelectStrategy(server, strategy, strategy.name())) {
+                    return strategy;
+                }
             }
             String availableFields = Arrays.toString(serverClass.getDeclaredFields());
             String availableMethods = Arrays.toString(serverClass.getDeclaredMethods());
-            LOGGER.error("Unable to resolve current server tick for {}. Fields: {} Methods: {}",
+            LOGGER.warn("Unable to resolve current server tick for {}. Fields: {} Methods: {}",
                     serverClass.getName(), availableFields, availableMethods);
-            throw new IllegalStateException("Unable to resolve current server tick; update FAWE or configure a compatible server build.");
+            if (FALLBACK_WARNED.compareAndSet(false, true)) {
+                LOGGER.warn("TickAccess: using approximate tick fallback.");
+            }
+            setStrategy(FALLBACK_STRATEGY);
+            return FALLBACK_STRATEGY;
         }
 
         private static Field findField(Class<?> type, String name) {
@@ -402,7 +434,11 @@ public class PaperweightFaweWorldNativeAccess implements WorldNativeAccess<Level
             try {
                 Class<?> bukkitClass = Class.forName("org.bukkit.Bukkit");
                 Method method = bukkitClass.getDeclaredMethod("getCurrentTick");
-                if (method.getReturnType() != int.class || method.getParameterCount() != 0) {
+                if (method.getParameterCount() != 0) {
+                    return null;
+                }
+                Class<?> type = method.getReturnType();
+                if (type != int.class && type != long.class) {
                     return null;
                 }
                 method.setAccessible(true);
@@ -412,19 +448,82 @@ public class PaperweightFaweWorldNativeAccess implements WorldNativeAccess<Level
             }
         }
 
-        private static int getIntField(Field field, Object target) {
+        private static int getNumberField(Field field, Object target) {
             try {
+                if (field.getType() == long.class) {
+                    return (int) field.getLong(target);
+                }
                 return field.getInt(target);
             } catch (IllegalAccessException e) {
-                throw new IllegalStateException("Unable to access MinecraftServer tick field " + field.getName(), e);
+                throw new UnsupportedTickSourceException("Unable to access MinecraftServer tick field " + field.getName(), e);
             }
         }
 
-        private static int invokeIntMethod(Method method, Object target) {
+        private static int invokeNumberMethod(Method method, Object target) {
             try {
-                return (int) method.invoke(target);
-            } catch (ReflectiveOperationException e) {
-                throw new IllegalStateException("Unable to invoke MinecraftServer tick method " + method.getName(), e);
+                Object value = method.invoke(target);
+                if (value instanceof Number number) {
+                    return number.intValue();
+                }
+                throw new UnsupportedTickSourceException("Unexpected return type from tick method " + method.getName());
+            } catch (InvocationTargetException e) {
+                Throwable cause = e.getCause();
+                if (cause instanceof UnsupportedOperationException) {
+                    throw new UnsupportedTickSourceException("Tick method " + method.getName() + " is unsupported", cause);
+                }
+                throw new UnsupportedTickSourceException("Unable to invoke MinecraftServer tick method " + method.getName(), cause);
+            } catch (IllegalAccessException | IncompatibleClassChangeError e) {
+                throw new UnsupportedTickSourceException("Unable to access MinecraftServer tick method " + method.getName(), e);
+            } catch (RuntimeException e) {
+                if (e instanceof UndeclaredThrowableException undeclared && undeclared.getUndeclaredThrowable() instanceof UnsupportedOperationException) {
+                    throw new UnsupportedTickSourceException("Tick method " + method.getName() + " is unsupported", undeclared);
+                }
+                throw e;
+            }
+        }
+
+        private static boolean trySelectStrategy(MinecraftServer server, Strategy strategy, String description) {
+            if (DISABLED_STRATEGIES.contains(strategy.name())) {
+                return false;
+            }
+            try {
+                strategy.supplier().applyAsInt(server);
+            } catch (UnsupportedTickSourceException e) {
+                disableStrategy(strategy, "is unsupported on this server");
+                return false;
+            } catch (RuntimeException e) {
+                disableStrategy(strategy, "failed with " + e.getClass().getSimpleName());
+                return false;
+            }
+            LOGGER.info("TickAccess: using {}.", description);
+            setStrategy(strategy);
+            return true;
+        }
+
+        private static void disableStrategy(Strategy strategy, String reason) {
+            if (DISABLED_STRATEGIES.add(strategy.name()) && UNSUPPORTED_WARNED.compareAndSet(false, true)) {
+                LOGGER.warn("TickAccess: {} {}. Falling back.", strategy.name(), reason);
+            }
+            if (strategy == FALLBACK_STRATEGY && FALLBACK_WARNED.compareAndSet(false, true)) {
+                LOGGER.warn("TickAccess: using approximate tick fallback.");
+            }
+            TICK_STRATEGY = null;
+        }
+
+        private static void setStrategy(Strategy strategy) {
+            TICK_STRATEGY = strategy;
+        }
+
+        private record Strategy(String name, ToIntFunction<MinecraftServer> supplier) {
+        }
+
+        private static final class UnsupportedTickSourceException extends RuntimeException {
+            private UnsupportedTickSourceException(String message) {
+                super(message);
+            }
+
+            private UnsupportedTickSourceException(String message, Throwable cause) {
+                super(message, cause);
             }
         }
     }
