@@ -6,6 +6,7 @@ import com.fastasyncworldedit.core.util.TaskManager;
 import com.fastasyncworldedit.core.util.task.RunnableVal;
 import com.sk89q.worldedit.bukkit.BukkitAdapter;
 import com.sk89q.worldedit.internal.block.BlockStateIdAccess;
+import com.sk89q.worldedit.internal.util.LogManagerCompat;
 import com.sk89q.worldedit.internal.wna.WorldNativeAccess;
 import com.sk89q.worldedit.util.SideEffect;
 import com.sk89q.worldedit.util.SideEffectSet;
@@ -26,20 +27,27 @@ import org.bukkit.craftbukkit.CraftWorld;
 import org.bukkit.craftbukkit.block.data.CraftBlockData;
 import org.bukkit.event.block.BlockPhysicsEvent;
 import org.enginehub.linbus.tree.LinCompoundTag;
+import org.apache.logging.log4j.Logger;
 
 import javax.annotation.Nullable;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
 import java.lang.ref.WeakReference;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.ToIntFunction;
 
 import static com.sk89q.worldedit.bukkit.adapter.impl.fawe.v1_21_11.PaperweightPlatformAdapter.createInput;
 
 public class PaperweightFaweWorldNativeAccess implements WorldNativeAccess<LevelChunk,
         net.minecraft.world.level.block.state.BlockState, BlockPos> {
 
+    private static final Logger LOGGER = LogManagerCompat.getLogger();
     private static final int UPDATE = 1;
     private static final int NOTIFY = 2;
     private static final Direction[] NEIGHBOUR_ORDER = {
@@ -62,11 +70,19 @@ public class PaperweightFaweWorldNativeAccess implements WorldNativeAccess<Level
         this.level = level;
         // Use the actual tick as minecraft-defined so we don't try to force blocks into the world when the server's already lagging.
         //  - With the caveat that we don't want to have too many cached changed (1024) so we'd flush those at 1024 anyway.
-        this.lastTick = new AtomicInteger(MinecraftServer.currentTick);
+        this.lastTick = new AtomicInteger(getCurrentServerTick());
     }
 
     private Level getLevel() {
         return Objects.requireNonNull(level.get(), "The reference to the world was lost");
+    }
+
+    private int getCurrentServerTick() {
+        MinecraftServer server = getLevel().getServer();
+        if (server == null) {
+            throw new IllegalStateException("MinecraftServer unavailable for tick access.");
+        }
+        return TickAccess.getCurrentTick(server);
     }
 
     @Override
@@ -98,7 +114,7 @@ public class PaperweightFaweWorldNativeAccess implements WorldNativeAccess<Level
             LevelChunk levelChunk, BlockPos blockPos,
             net.minecraft.world.level.block.state.BlockState blockState
     ) {
-        int currentTick = MinecraftServer.currentTick;
+        int currentTick = getCurrentServerTick();
         if (Fawe.isMainThread()) {
             return levelChunk.setBlockState(blockPos, blockState,
                     this.sideEffectSet.shouldApply(SideEffect.UPDATE) ? 0 : 512
@@ -292,6 +308,125 @@ public class PaperweightFaweWorldNativeAccess implements WorldNativeAccess<Level
             net.minecraft.world.level.block.state.BlockState blockState
     ) {
 
+    }
+
+    private static final class TickAccess {
+        private static final String[] FIELD_NAMES = {
+                "currentTick",
+                "tickCount",
+                "tickCounter",
+                "serverTick",
+                "tick"
+        };
+        private static final String[] METHOD_NAMES = {
+                "getTickCount",
+                "getTick",
+                "getServerTick",
+                "getTickCounter"
+        };
+        private static volatile ToIntFunction<MinecraftServer> TICK_SUPPLIER;
+
+        private TickAccess() {
+        }
+
+        private static int getCurrentTick(MinecraftServer server) {
+            ToIntFunction<MinecraftServer> supplier = TICK_SUPPLIER;
+            if (supplier == null) {
+                synchronized (TickAccess.class) {
+                    supplier = TICK_SUPPLIER;
+                    if (supplier == null) {
+                        supplier = resolveTickSupplier(server);
+                        TICK_SUPPLIER = supplier;
+                    }
+                }
+            }
+            return supplier.applyAsInt(server);
+        }
+
+        private static ToIntFunction<MinecraftServer> resolveTickSupplier(MinecraftServer server) {
+            Class<?> serverClass = server != null ? server.getClass() : MinecraftServer.class;
+            for (String name : FIELD_NAMES) {
+                Field field = findField(serverClass, name);
+                if (field == null || field.getType() != int.class) {
+                    continue;
+                }
+                boolean isStatic = Modifier.isStatic(field.getModifiers());
+                field.setAccessible(true);
+                LOGGER.info("Resolved server tick via MinecraftServer field '{}'.", name);
+                return isStatic ? s -> getIntField(field, null) : s -> getIntField(field, s);
+            }
+            for (String name : METHOD_NAMES) {
+                Method method = findMethod(serverClass, name);
+                if (method == null || method.getReturnType() != int.class || method.getParameterCount() != 0) {
+                    continue;
+                }
+                boolean isStatic = Modifier.isStatic(method.getModifiers());
+                method.setAccessible(true);
+                LOGGER.info("Resolved server tick via MinecraftServer method '{}()'.", name);
+                return isStatic ? s -> invokeIntMethod(method, null) : s -> invokeIntMethod(method, s);
+            }
+            Method bukkitMethod = findBukkitCurrentTickMethod();
+            if (bukkitMethod != null) {
+                LOGGER.info("Resolved server tick via Bukkit.getCurrentTick().");
+                return s -> invokeIntMethod(bukkitMethod, null);
+            }
+            String availableFields = Arrays.toString(serverClass.getDeclaredFields());
+            String availableMethods = Arrays.toString(serverClass.getDeclaredMethods());
+            LOGGER.error("Unable to resolve current server tick for {}. Fields: {} Methods: {}",
+                    serverClass.getName(), availableFields, availableMethods);
+            throw new IllegalStateException("Unable to resolve current server tick; update FAWE or configure a compatible server build.");
+        }
+
+        private static Field findField(Class<?> type, String name) {
+            for (Class<?> current = type; current != null; current = current.getSuperclass()) {
+                try {
+                    return current.getDeclaredField(name);
+                } catch (NoSuchFieldException ignored) {
+                }
+            }
+            return null;
+        }
+
+        private static Method findMethod(Class<?> type, String name) {
+            for (Class<?> current = type; current != null; current = current.getSuperclass()) {
+                try {
+                    return current.getDeclaredMethod(name);
+                } catch (NoSuchMethodException ignored) {
+                }
+            }
+            return null;
+        }
+
+        @Nullable
+        private static Method findBukkitCurrentTickMethod() {
+            try {
+                Class<?> bukkitClass = Class.forName("org.bukkit.Bukkit");
+                Method method = bukkitClass.getDeclaredMethod("getCurrentTick");
+                if (method.getReturnType() != int.class || method.getParameterCount() != 0) {
+                    return null;
+                }
+                method.setAccessible(true);
+                return method;
+            } catch (ClassNotFoundException | NoSuchMethodException ignored) {
+                return null;
+            }
+        }
+
+        private static int getIntField(Field field, Object target) {
+            try {
+                return field.getInt(target);
+            } catch (IllegalAccessException e) {
+                throw new IllegalStateException("Unable to access MinecraftServer tick field " + field.getName(), e);
+            }
+        }
+
+        private static int invokeIntMethod(Method method, Object target) {
+            try {
+                return (int) method.invoke(target);
+            } catch (ReflectiveOperationException e) {
+                throw new IllegalStateException("Unable to invoke MinecraftServer tick method " + method.getName(), e);
+            }
+        }
     }
 
 }
